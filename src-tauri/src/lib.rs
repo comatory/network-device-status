@@ -1,4 +1,9 @@
-use std::{net::TcpStream, thread, time::Duration};
+use std::{
+    net::TcpStream,
+    sync::{Arc, Mutex},
+    thread,
+    time::Duration,
+};
 use tauri::{
     image::Image,
     menu::{CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
@@ -17,6 +22,9 @@ use system_configuration::{
     preferences::SCPreferences,
 };
 
+// (CheckMenuItem, bsd_name)
+type SharedItems = Arc<Mutex<Vec<(CheckMenuItem<tauri::Wry>, String)>>>;
+
 fn check_internet() -> bool {
     TcpStream::connect_timeout(
         &"1.1.1.1:53".parse::<std::net::SocketAddr>().unwrap(),
@@ -34,7 +42,6 @@ fn get_active_interface(store: &SCDynamicStore) -> Option<String> {
     let key = CFString::new("State:/Network/Global/IPv4");
     let plist = store.get(key)?;
 
-    // State:/Network/Global/IPv4 is always a CFDictionary<CFString, ...>
     let dict: CFDictionary<CFString, CFType> = unsafe {
         CFDictionary::wrap_under_get_rule(plist.as_concrete_TypeRef() as _)
     };
@@ -89,41 +96,78 @@ fn create_dot_icon(connected: bool) -> Image<'static> {
     Image::new_owned(rgba, size, size)
 }
 
-fn rebuild_menu(
+fn create_items(
     app: &AppHandle,
-    services: &[(String, String)], // (display_name, bsd_name)
-    active: Option<&str>,          // bsd_name of active interface
-) -> tauri::Result<Menu<tauri::Wry>> {
-    // disabled = no hover highlight, no click; checked = native ✓ for active
-    let items: Vec<CheckMenuItem<tauri::Wry>> = services
+    services: &[(String, String)],
+    active: Option<&str>,
+) -> tauri::Result<Vec<(CheckMenuItem<tauri::Wry>, String)>> {
+    services
         .iter()
         .map(|(display, bsd)| {
-            let is_active = Some(bsd.as_str()) == active;
-            CheckMenuItem::with_id(app, bsd, display, true, is_active, None::<&str>)
+            let item = CheckMenuItem::with_id(
+                app,
+                bsd,
+                display,
+                true,
+                Some(bsd.as_str()) == active,
+                None::<&str>,
+            )?;
+            Ok((item, bsd.clone()))
         })
-        .collect::<tauri::Result<Vec<_>>>()?;
+        .collect()
+}
 
+fn assemble_menu(
+    app: &AppHandle,
+    items: &[(CheckMenuItem<tauri::Wry>, String)],
+) -> tauri::Result<Menu<tauri::Wry>> {
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
 
     let mut refs: Vec<&dyn IsMenuItem<tauri::Wry>> =
-        items.iter().map(|i| i as &dyn IsMenuItem<tauri::Wry>).collect();
+        items.iter().map(|(i, _)| i as &dyn IsMenuItem<tauri::Wry>).collect();
     refs.push(&sep);
     refs.push(&quit);
 
     Menu::with_items(app, &refs)
 }
 
+// Update checkmarks in-place. Returns true if service list changed (requiring a full menu swap).
+fn sync_items(
+    items: &[(CheckMenuItem<tauri::Wry>, String)],
+    services: &[(String, String)],
+    active: Option<&str>,
+) -> bool {
+    let same = items.len() == services.len()
+        && items.iter().zip(services).all(|((_, b), (_, sb))| b == sb);
+    if same {
+        for (item, bsd) in items {
+            let _ = item.set_checked(active.as_deref() == Some(bsd.as_str()));
+        }
+    }
+    !same
+}
+
 struct NetworkCtx {
     handle: AppHandle,
+    items: SharedItems,
 }
 
 fn on_network_change(store: SCDynamicStore, _: CFArray<CFString>, ctx: &mut NetworkCtx) {
-    let services = get_network_services();
     let active = get_active_interface(&store);
-    if let Some(tray) = ctx.handle.tray_by_id("main") {
-        if let Ok(menu) = rebuild_menu(&ctx.handle, &services, active.as_deref()) {
-            let _ = tray.set_menu(Some(menu));
+    let services = get_network_services();
+    let mut items = ctx.items.lock().unwrap();
+
+    let needs_rebuild = sync_items(&items, &services, active.as_deref());
+    if needs_rebuild {
+        // Services list changed — replace menu (will close if open, but this is rare)
+        if let Ok(new_items) = create_items(&ctx.handle, &services, active.as_deref()) {
+            *items = new_items;
+            if let Ok(menu) = assemble_menu(&ctx.handle, &items) {
+                if let Some(tray) = ctx.handle.tray_by_id("main") {
+                    let _ = tray.set_menu(Some(menu));
+                }
+            }
         }
     }
 }
@@ -139,12 +183,18 @@ pub fn run() {
             let active = get_active_interface(&init_store);
             let connected = check_internet();
             let icon = create_dot_icon(connected);
-            let menu = rebuild_menu(app.handle(), &services, active.as_deref())?;
 
+            let items: SharedItems = Arc::new(Mutex::new(
+                create_items(app.handle(), &services, active.as_deref())?,
+            ));
+
+            let menu = assemble_menu(app.handle(), &items.lock().unwrap())?;
+
+            let items_for_event = items.clone();
             let _tray = TrayIconBuilder::with_id("main")
                 .icon(icon)
                 .menu(&menu)
-                .on_menu_event(|app: &AppHandle, event: MenuEvent| {
+                .on_menu_event(move |app: &AppHandle, event: MenuEvent| {
                     if event.id() == "quit" {
                         app.exit(0);
                     } else {
@@ -152,14 +202,12 @@ pub fn run() {
                         let _ = std::process::Command::new("open")
                             .arg("x-apple.systempreferences:com.apple.Network-Settings.extension")
                             .spawn();
-                        // Rebuild menu immediately to reset the CheckMenuItem toggle
+                        // Reset CheckMenuItem toggle in-place (menu already closed on click)
                         let store = SCDynamicStoreBuilder::new("net-click").build();
-                        let services = get_network_services();
                         let active = get_active_interface(&store);
-                        if let Some(tray) = app.tray_by_id("main") {
-                            if let Ok(menu) = rebuild_menu(app, &services, active.as_deref()) {
-                                let _ = tray.set_menu(Some(menu));
-                            }
+                        let items = items_for_event.lock().unwrap();
+                        for (item, bsd) in items.iter() {
+                            let _ = item.set_checked(active.as_deref() == Some(bsd.as_str()));
                         }
                     }
                 })
@@ -167,11 +215,12 @@ pub fn run() {
 
             // Thread 1: SCDynamicStore event-driven interface monitoring
             let handle1 = app.handle().clone();
+            let items_for_ctx = items.clone();
             thread::spawn(move || {
                 let store = SCDynamicStoreBuilder::new("net-monitor")
                     .callback_context(SCDynamicStoreCallBackContext {
                         callout: on_network_change,
-                        info: NetworkCtx { handle: handle1 },
+                        info: NetworkCtx { handle: handle1, items: items_for_ctx },
                     })
                     .build();
 
