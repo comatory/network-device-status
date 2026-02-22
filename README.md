@@ -13,7 +13,15 @@ MacOS menubar application which does few simple things. It indicates internet co
 
 ## Install
 
-The easiest way is to pick the latest release from [releases page](https://github.com/comatory/network-device-status/releases).
+### Homebrew (preferred)
+
+```shell
+brew install --cask comatory/tap/network-device-status
+```
+
+### Manual
+
+Pick the latest release from the [releases page](https://github.com/comatory/network-device-status/releases).
 You might get security warnings when starting the app for the first time, open _Privacy & Security_ settings, you should see the application listed there with the button _Open anyway_. Clicking it will allow you to launch it.
 
 ## Build
