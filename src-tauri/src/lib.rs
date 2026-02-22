@@ -1,3 +1,4 @@
+use smappservice_rs::{AppService, ServiceStatus, ServiceType};
 use std::{
     net::TcpStream,
     sync::{Arc, Mutex},
@@ -17,7 +18,7 @@ use system_configuration::{
 };
 use tauri::{
     image::Image,
-    menu::{CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
+    menu::{CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
     tray::TrayIconBuilder,
     AppHandle,
 };
@@ -25,6 +26,19 @@ use tauri_plugin_notification::NotificationExt;
 
 // (CheckMenuItem, bsd_name)
 type SharedItems = Arc<Mutex<Vec<(CheckMenuItem<tauri::Wry>, String)>>>;
+
+fn is_launch_at_login_enabled() -> bool {
+    AppService::new(ServiceType::MainApp).status() == ServiceStatus::Enabled
+}
+
+fn toggle_launch_at_login(enable: bool) -> bool {
+    let service = AppService::new(ServiceType::MainApp);
+    if enable {
+        service.register().is_ok()
+    } else {
+        service.unregister().is_ok()
+    }
+}
 
 fn check_internet() -> bool {
     TcpStream::connect_timeout(
@@ -127,15 +141,27 @@ fn create_items(
 fn assemble_menu(
     app: &AppHandle,
     items: &[(CheckMenuItem<tauri::Wry>, String)],
+    launch_at_login: bool,
 ) -> tauri::Result<Menu<tauri::Wry>> {
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let launch = CheckMenuItem::with_id(
+        app,
+        "launch_at_login",
+        "Launch at Login",
+        true,
+        launch_at_login,
+        None::<&str>,
+    )?;
+
+    let settings_menu = Submenu::with_items(app, "Settings", true, &[&launch])?;
 
     let mut refs: Vec<&dyn IsMenuItem<tauri::Wry>> = items
         .iter()
         .map(|(i, _)| i as &dyn IsMenuItem<tauri::Wry>)
         .collect();
     refs.push(&sep);
+    refs.push(&settings_menu);
     refs.push(&quit);
 
     Menu::with_items(app, &refs)
@@ -185,10 +211,10 @@ fn on_network_change(store: SCDynamicStore, _: CFArray<CFString>, ctx: &mut Netw
 
     let needs_rebuild = sync_items(&items, &services, active.as_deref());
     if needs_rebuild {
-        // Services list changed — replace menu (will close if open, but this is rare)
+        let launch_at_login = is_launch_at_login_enabled();
         if let Ok(new_items) = create_items(&ctx.handle, &services, active.as_deref()) {
             *items = new_items;
-            if let Ok(menu) = assemble_menu(&ctx.handle, &items) {
+            if let Ok(menu) = assemble_menu(&ctx.handle, &items, launch_at_login) {
                 if let Some(tray) = ctx.handle.tray_by_id("main") {
                     let _ = tray.set_menu(Some(menu));
                 }
@@ -227,7 +253,8 @@ pub fn run() {
                 active.as_deref(),
             )?));
 
-            let menu = assemble_menu(app.handle(), &items.lock().unwrap())?;
+            let launch_at_login = is_launch_at_login_enabled();
+            let menu = assemble_menu(app.handle(), &items.lock().unwrap(), launch_at_login)?;
 
             let items_for_event = items.clone();
             let _tray = TrayIconBuilder::with_id("main")
@@ -236,6 +263,9 @@ pub fn run() {
                 .on_menu_event(move |app: &AppHandle, event: MenuEvent| {
                     if event.id() == "quit" {
                         app.exit(0);
+                    } else if event.id() == "launch_at_login" {
+                        let current = is_launch_at_login_enabled();
+                        let _ = toggle_launch_at_login(!current);
                     } else {
                         // Open Network Settings
                         let _ = std::process::Command::new("open")
