@@ -4,7 +4,11 @@ MacOS menubar application which does few simple things. It indicates internet co
 
 ## Install
 
-You need Bun runtime installed. Create your own binary by running:
+The easiest way is to pick the latest release from [releases page](https://github.com/comatory/network-device-status/releases).
+
+## Build
+
+You need Bun runtime and `rustc` installed. Create your own binary by running:
 
 `bun tauri build`
 
