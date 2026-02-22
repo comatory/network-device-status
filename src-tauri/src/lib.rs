@@ -20,9 +20,10 @@ use tauri::{
     image::Image,
     menu::{CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
     tray::TrayIconBuilder,
-    AppHandle,
+    AppHandle, Manager,
 };
 use tauri_plugin_notification::NotificationExt;
+use tauri_plugin_store::StoreExt;
 
 // (CheckMenuItem, bsd_name)
 type SharedItems = Arc<Mutex<Vec<(CheckMenuItem<tauri::Wry>, String)>>>;
@@ -37,6 +38,24 @@ fn toggle_launch_at_login(enable: bool) -> bool {
         service.register().is_ok()
     } else {
         service.unregister().is_ok()
+    }
+}
+
+fn load_show_notifications(app: &AppHandle) -> bool {
+    if let Ok(store) = app.store("settings.json") {
+        store
+            .get("show_notifications")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
+    } else {
+        true
+    }
+}
+
+fn save_show_notifications(app: &AppHandle, value: bool) {
+    if let Ok(store) = app.store("settings.json") {
+        store.set("show_notifications", serde_json::Value::Bool(value));
+        let _ = store.save();
     }
 }
 
@@ -142,6 +161,7 @@ fn assemble_menu(
     app: &AppHandle,
     items: &[(CheckMenuItem<tauri::Wry>, String)],
     launch_at_login: bool,
+    show_notifications: bool,
 ) -> tauri::Result<Menu<tauri::Wry>> {
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
@@ -153,8 +173,16 @@ fn assemble_menu(
         launch_at_login,
         None::<&str>,
     )?;
+    let notify = CheckMenuItem::with_id(
+        app,
+        "show_notifications",
+        "Show notification when interface changes",
+        true,
+        show_notifications,
+        None::<&str>,
+    )?;
 
-    let settings_menu = Submenu::with_items(app, "Settings", true, &[&launch])?;
+    let settings_menu = Submenu::with_items(app, "Settings", true, &[&launch, &notify])?;
 
     let mut refs: Vec<&dyn IsMenuItem<tauri::Wry>> = items
         .iter()
@@ -196,15 +224,18 @@ fn on_network_change(store: SCDynamicStore, _: CFArray<CFString>, ctx: &mut Netw
 
     let prev_interface = ctx.previous_interface.lock().unwrap().clone();
     if active != prev_interface {
-        if let Some(ref iface) = active {
-            let display_name = get_display_name(iface);
-            let _ = ctx
-                .handle
-                .notification()
-                .builder()
-                .title("Network Interface Changed")
-                .body(&format!("Switched to {}", display_name))
-                .show();
+        let show_notifications = load_show_notifications(&ctx.handle);
+        if show_notifications {
+            if let Some(ref iface) = active {
+                let display_name = get_display_name(iface);
+                let _ = ctx
+                    .handle
+                    .notification()
+                    .builder()
+                    .title("Network Interface Changed")
+                    .body(&format!("Switched to {}", display_name))
+                    .show();
+            }
         }
         *ctx.previous_interface.lock().unwrap() = active.clone();
     }
@@ -212,9 +243,12 @@ fn on_network_change(store: SCDynamicStore, _: CFArray<CFString>, ctx: &mut Netw
     let needs_rebuild = sync_items(&items, &services, active.as_deref());
     if needs_rebuild {
         let launch_at_login = is_launch_at_login_enabled();
+        let show_notifications = load_show_notifications(&ctx.handle);
         if let Ok(new_items) = create_items(&ctx.handle, &services, active.as_deref()) {
             *items = new_items;
-            if let Ok(menu) = assemble_menu(&ctx.handle, &items, launch_at_login) {
+            if let Ok(menu) =
+                assemble_menu(&ctx.handle, &items, launch_at_login, show_notifications)
+            {
                 if let Some(tray) = ctx.handle.tray_by_id("main") {
                     let _ = tray.set_menu(Some(menu));
                 }
@@ -226,6 +260,7 @@ fn on_network_change(store: SCDynamicStore, _: CFArray<CFString>, ctx: &mut Netw
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_store::Builder::default().build())
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -236,15 +271,18 @@ pub fn run() {
             let connected = check_internet();
             let icon = create_dot_icon(connected);
 
-            if let Some(ref iface) = active {
-                let display_name = get_display_name(iface);
-                let _ = app
-                    .handle()
-                    .notification()
-                    .builder()
-                    .title("Network Interface")
-                    .body(&format!("Connected to {}", display_name))
-                    .show();
+            let show_notifications = load_show_notifications(app.handle());
+            if show_notifications {
+                if let Some(ref iface) = active {
+                    let display_name = get_display_name(iface);
+                    let _ = app
+                        .handle()
+                        .notification()
+                        .builder()
+                        .title("Network Interface")
+                        .body(&format!("Connected to {}", display_name))
+                        .show();
+                }
             }
 
             let items: SharedItems = Arc::new(Mutex::new(create_items(
@@ -254,9 +292,16 @@ pub fn run() {
             )?));
 
             let launch_at_login = is_launch_at_login_enabled();
-            let menu = assemble_menu(app.handle(), &items.lock().unwrap(), launch_at_login)?;
+            let show_notifications = load_show_notifications(app.handle());
+            let menu = assemble_menu(
+                app.handle(),
+                &items.lock().unwrap(),
+                launch_at_login,
+                show_notifications,
+            )?;
 
             let items_for_event = items.clone();
+            let app_handle = app.handle().clone();
             let _tray = TrayIconBuilder::with_id("main")
                 .icon(icon)
                 .menu(&menu)
@@ -266,6 +311,10 @@ pub fn run() {
                     } else if event.id() == "launch_at_login" {
                         let current = is_launch_at_login_enabled();
                         let _ = toggle_launch_at_login(!current);
+                    } else if event.id() == "show_notifications" {
+                        let current = load_show_notifications(&app_handle);
+                        let new_value = !current;
+                        save_show_notifications(&app_handle, new_value);
                     } else {
                         // Open Network Settings
                         let _ = std::process::Command::new("open")
