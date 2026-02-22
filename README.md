@@ -4,7 +4,7 @@
     <img
         alt="Screenshot of the application running in menubar"
         src="https://github.com/comatory/network-device-status/raw/main/doc/screenshot.png"
-        width="600px"
+        width="400px"
         height="auto"
     />
 </div>
