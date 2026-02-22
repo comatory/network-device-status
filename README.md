@@ -1,10 +1,13 @@
 # Network Device Status
 
+![Screenshot of the application running in menubar](doc/screenshot.png)
+
 MacOS menubar application which does few simple things. It indicates internet connectivity by polling 1.1.1.1, but it's main feature is showing which network interface is providing the connectivity. It is useful if you want to be sure that you've connected from LAN to Wi-Fi for example.
 
 ## Install
 
 The easiest way is to pick the latest release from [releases page](https://github.com/comatory/network-device-status/releases).
+You might get security warnings when starting the app for the first time, open _Privacy & Security_ settings, you should see the application listed there with the button _Open anyway_. Clicking it will allow you to launch it.
 
 ## Build
 
