@@ -1,6 +1,11 @@
 # Network Device Status
 
-![Screenshot of the application running in menubar](doc/screenshot.png)
+<img
+    alt="Screenshot of the application running in menubar"
+    src="https://github.com/comatory/network-device-status/raw/main/doc/screenshot.png"
+    width="600px"
+    height="auto"
+/>
 
 MacOS menubar application which does few simple things. It indicates internet connectivity by polling 1.1.1.1, but it's main feature is showing which network interface is providing the connectivity. It is useful if you want to be sure that you've connected from LAN to Wi-Fi for example.
 
