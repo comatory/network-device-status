@@ -4,23 +4,24 @@ use std::{
     thread,
     time::Duration,
 };
-use tauri::{
-    image::Image,
-    menu::{CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
-    tray::TrayIconBuilder,
-    AppHandle,
-};
 use system_configuration::{
     core_foundation::{
         array::CFArray,
         base::TCFType,
-        runloop::{CFRunLoop, kCFRunLoopDefaultMode},
+        runloop::{kCFRunLoopDefaultMode, CFRunLoop},
         string::CFString,
     },
     dynamic_store::{SCDynamicStore, SCDynamicStoreBuilder, SCDynamicStoreCallBackContext},
     network_configuration::SCNetworkService,
     preferences::SCPreferences,
 };
+use tauri::{
+    image::Image,
+    menu::{CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
+    tray::TrayIconBuilder,
+    AppHandle,
+};
+use tauri_plugin_notification::NotificationExt;
 
 // (CheckMenuItem, bsd_name)
 type SharedItems = Arc<Mutex<Vec<(CheckMenuItem<tauri::Wry>, String)>>>;
@@ -34,21 +35,19 @@ fn check_internet() -> bool {
 }
 
 fn get_active_interface(store: &SCDynamicStore) -> Option<String> {
-    use system_configuration::core_foundation::{
-        base::CFType,
-        dictionary::CFDictionary,
-    };
+    use system_configuration::core_foundation::{base::CFType, dictionary::CFDictionary};
 
     let key = CFString::new("State:/Network/Global/IPv4");
     let plist = store.get(key)?;
 
-    let dict: CFDictionary<CFString, CFType> = unsafe {
-        CFDictionary::wrap_under_get_rule(plist.as_concrete_TypeRef() as _)
-    };
+    let dict: CFDictionary<CFString, CFType> =
+        unsafe { CFDictionary::wrap_under_get_rule(plist.as_concrete_TypeRef() as _) };
 
     let iface_key = CFString::new("PrimaryInterface");
     let value = dict.find(iface_key)?;
-    value.downcast::<CFString>().map(|s: CFString| s.to_string())
+    value
+        .downcast::<CFString>()
+        .map(|s: CFString| s.to_string())
 }
 
 // Returns (display_name, bsd_name) for each TCP/IP-capable network service.
@@ -66,6 +65,14 @@ fn get_network_services() -> Vec<(String, String)> {
             Some((display, bsd))
         })
         .collect()
+}
+
+fn get_display_name(bsd_name: &str) -> String {
+    get_network_services()
+        .into_iter()
+        .find(|(_, bsd)| bsd == bsd_name)
+        .map(|(display, _)| display)
+        .unwrap_or_else(|| bsd_name.to_string())
 }
 
 fn create_dot_icon(connected: bool) -> Image<'static> {
@@ -124,8 +131,10 @@ fn assemble_menu(
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
 
-    let mut refs: Vec<&dyn IsMenuItem<tauri::Wry>> =
-        items.iter().map(|(i, _)| i as &dyn IsMenuItem<tauri::Wry>).collect();
+    let mut refs: Vec<&dyn IsMenuItem<tauri::Wry>> = items
+        .iter()
+        .map(|(i, _)| i as &dyn IsMenuItem<tauri::Wry>)
+        .collect();
     refs.push(&sep);
     refs.push(&quit);
 
@@ -151,12 +160,28 @@ fn sync_items(
 struct NetworkCtx {
     handle: AppHandle,
     items: SharedItems,
+    previous_interface: Mutex<Option<String>>,
 }
 
 fn on_network_change(store: SCDynamicStore, _: CFArray<CFString>, ctx: &mut NetworkCtx) {
     let active = get_active_interface(&store);
     let services = get_network_services();
     let mut items = ctx.items.lock().unwrap();
+
+    let prev_interface = ctx.previous_interface.lock().unwrap().clone();
+    if active != prev_interface {
+        if let Some(ref iface) = active {
+            let display_name = get_display_name(iface);
+            let _ = ctx
+                .handle
+                .notification()
+                .builder()
+                .title("Network Interface Changed")
+                .body(&format!("Switched to {}", display_name))
+                .show();
+        }
+        *ctx.previous_interface.lock().unwrap() = active.clone();
+    }
 
     let needs_rebuild = sync_items(&items, &services, active.as_deref());
     if needs_rebuild {
@@ -174,6 +199,7 @@ fn on_network_change(store: SCDynamicStore, _: CFArray<CFString>, ctx: &mut Netw
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -184,9 +210,22 @@ pub fn run() {
             let connected = check_internet();
             let icon = create_dot_icon(connected);
 
-            let items: SharedItems = Arc::new(Mutex::new(
-                create_items(app.handle(), &services, active.as_deref())?,
-            ));
+            if let Some(ref iface) = active {
+                let display_name = get_display_name(iface);
+                let _ = app
+                    .handle()
+                    .notification()
+                    .builder()
+                    .title("Network Interface")
+                    .body(&format!("Connected to {}", display_name))
+                    .show();
+            }
+
+            let items: SharedItems = Arc::new(Mutex::new(create_items(
+                app.handle(),
+                &services,
+                active.as_deref(),
+            )?));
 
             let menu = assemble_menu(app.handle(), &items.lock().unwrap())?;
 
@@ -216,11 +255,16 @@ pub fn run() {
             // Thread 1: SCDynamicStore event-driven interface monitoring
             let handle1 = app.handle().clone();
             let items_for_ctx = items.clone();
+            let initial_interface = active.clone();
             thread::spawn(move || {
                 let store = SCDynamicStoreBuilder::new("net-monitor")
                     .callback_context(SCDynamicStoreCallBackContext {
                         callout: on_network_change,
-                        info: NetworkCtx { handle: handle1, items: items_for_ctx },
+                        info: NetworkCtx {
+                            handle: handle1,
+                            items: items_for_ctx,
+                            previous_interface: Mutex::new(initial_interface),
+                        },
                     })
                     .build();
 
