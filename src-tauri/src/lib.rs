@@ -20,7 +20,7 @@ use tauri::{
     image::Image,
     menu::{CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
     tray::TrayIconBuilder,
-    AppHandle, Manager,
+    AppHandle,
 };
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_store::StoreExt;
@@ -164,6 +164,7 @@ fn assemble_menu(
     show_notifications: bool,
 ) -> tauri::Result<Menu<tauri::Wry>> {
     let sep = PredefinedMenuItem::separator(app)?;
+    let about = MenuItem::with_id(app, "about", "About", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let launch = CheckMenuItem::with_id(
         app,
@@ -190,6 +191,7 @@ fn assemble_menu(
         .collect();
     refs.push(&sep);
     refs.push(&settings_menu);
+    refs.push(&about);
     refs.push(&quit);
 
     Menu::with_items(app, &refs)
@@ -308,6 +310,10 @@ pub fn run() {
                 .on_menu_event(move |app: &AppHandle, event: MenuEvent| {
                     if event.id() == "quit" {
                         app.exit(0);
+                    } else if event.id() == "about" {
+                        let _ = std::process::Command::new("open")
+                            .arg("https://github.com/comatory/network-device-status")
+                            .spawn();
                     } else if event.id() == "launch_at_login" {
                         let current = is_launch_at_login_enabled();
                         let _ = toggle_launch_at_login(!current);
